@@ -97,10 +97,7 @@ Blit → Swapchain → Present
 
 ## 🔧 Building
 ```bash
-# Prerequisites
-# - Vulkan SDK 1.4+
-# - CMake 3.20+
-# - vcpkg (for GLFW)
+# Prerequisites: Vulkan SDK 1.4+, CMake 3.20+, vcpkg
 
 # Clone
 git clone https://github.com/hir0-pixel/Gargantua.git
@@ -135,7 +132,7 @@ cmake --build build --config Release
 
 ## 📝 Development Notes
 
-**Performance Target:** 60 FPS at 1920×1080 on RTX 3070
-**Validation:** Enabled in debug builds for Vulkan API correctness
-**Coordinate System:** Schwarzschild coordinates (t, r, θ, φ) for spacetime
+**Performance Target:** 60 FPS at 1920×1080 on RTX 3070  
+**Validation:** Enabled in debug builds for Vulkan API correctness  
+**Coordinate System:** Schwarzschild coordinates (t, r, θ, φ) for spacetime  
 **Numerical Stability:** Adaptive step sizing near event horizon (planned)
