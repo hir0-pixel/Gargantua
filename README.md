@@ -139,15 +139,3 @@ cmake --build build --config Release
 **Validation:** Enabled in debug builds for Vulkan API correctness
 **Coordinate System:** Schwarzschild coordinates (t, r, θ, φ) for spacetime
 **Numerical Stability:** Adaptive step sizing near event horizon (planned)
-
----
-
-## 📄 License
-
-MIT License - See LICENSE file for details
-
----
-
-## 🌟 Acknowledgments
-
-Inspired by the scientific visualization of Gargantua in Christopher Nolan's *Interstellar*, based on calculations by physicist Kip Thorne and the visual effects team at Double Negative (DNEG).
