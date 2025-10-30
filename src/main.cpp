@@ -1,31 +1,38 @@
 #include <iostream>
+#include <stdexcept>
+
 #include <vulkan/vulkan.h>
-#include <GLFW/glfw3.h>
+#include "renderer/vulkan_context.h"
 
 int main() {
     std::cout << "Gargantua - Black Hole Raytracer\n";
     std::cout << "=================================\n\n";
-    
-    uint32_t extensionCount = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
-    std::cout << "Vulkan extensions available: " << extensionCount << "\n";
-    
-    if (!glfwInit()) {
-        std::cerr << "Failed to initialize GLFW\n";
+
+    try {
+        // Enable validation only in debug builds (constructor will honor _DEBUG)
+        VulkanContext ctx{/*enableValidation=*/true};
+
+        // Print selected GPU info
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(ctx.getPhysicalDevice(), &props);
+
+        std::cout << "\n[Info] Selected GPU: " << props.deviceName << "\n";
+        std::cout << "       API Version:  "
+                  << VK_API_VERSION_MAJOR(props.apiVersion) << "."
+                  << VK_API_VERSION_MINOR(props.apiVersion) << "."
+                  << VK_API_VERSION_PATCH(props.apiVersion) << "\n";
+        std::cout << "       Vendor ID:    0x" << std::hex << props.vendorID
+                  << "  Device ID: 0x" << props.deviceID << std::dec << "\n";
+
+        std::cout << "[Info] Queue Families:\n";
+        std::cout << "       Compute  Family Index: " << ctx.getComputeQueueFamily()  << "\n";
+        std::cout << "       Graphics Family Index: " << ctx.getGraphicsQueueFamily() << "\n";
+
+        std::cout << "\nSetup successful! VulkanContext is ready for compute workloads.\n";
+        return 0;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "\n[Error] " << e.what() << "\n";
         return -1;
     }
-    
-    std::cout << "GLFW initialized successfully\n";
-    
-    if (!glfwVulkanSupported()) {
-        std::cerr << "Vulkan not supported\n";
-        glfwTerminate();
-        return -1;
-    }
-    
-    std::cout << "Vulkan supported!\n\n";
-    std::cout << "Setup successful! Ready to build Gargantua.\n";
-    
-    glfwTerminate();
-    return 0;
 }
