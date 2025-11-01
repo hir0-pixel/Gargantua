@@ -58,7 +58,7 @@ int main() {
 
         Swapchain swapchain(context, window);
 
-        std::string shaderPath = std::string(GARGANTUA_SHADER_DIR) + "/test.comp.spv";
+        std::string shaderPath = std::string(GARGANTUA_SHADER_DIR) + "/gargantua.comp.spv";
         ComputePipeline compute(context, swapchain, shaderPath);
 
         VkDevice device = context.getDevice();
