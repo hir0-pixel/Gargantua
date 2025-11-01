@@ -85,10 +85,17 @@ void ComputePipeline::createDescriptorSetLayout() {
 }
 
 void ComputePipeline::createPipelineLayout() {
+    VkPushConstantRange pushConstant{};
+    pushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstant.offset = 0;
+    pushConstant.size = sizeof(CameraData);
+
     VkPipelineLayoutCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     ci.setLayoutCount = 1;
     ci.pSetLayouts = &descriptorSetLayout;
+    ci.pushConstantRangeCount = 1;
+    ci.pPushConstantRanges = &pushConstant;
 
     if (vkCreatePipelineLayout(device, &ci, nullptr, &pipelineLayout) != VK_SUCCESS) {
         throw std::runtime_error("[Compute] Failed to create pipeline layout.");
@@ -318,7 +325,7 @@ void ComputePipeline::recreate() {
     createDescriptorPoolAndSets();
 }
 
-void ComputePipeline::dispatch(uint32_t imageIndex, VkSemaphore waitSemaphore, VkSemaphore signalSemaphore) {
+void ComputePipeline::dispatch(uint32_t imageIndex, VkSemaphore waitSemaphore, VkSemaphore signalSemaphore, const CameraData& camera) {
     // ------- 1) COMPUTE: record on compute CMDBUF -------
     vkResetCommandBuffer(cmdCompute, 0);
     VkCommandBufferBeginInfo biCompute{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -327,6 +334,7 @@ void ComputePipeline::dispatch(uint32_t imageIndex, VkSemaphore waitSemaphore, V
 
     vkCmdBindPipeline(cmdCompute, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmdCompute, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(cmdCompute, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CameraData), &camera);
 
     VkExtent2D extent = sc.getExtent();
     const uint32_t wgX = (extent.width  + 15) / 16;
