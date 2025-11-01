@@ -1,0 +1,191 @@
+// ---------------------------------------------
+// Interstellar black hole simulation shader
+//
+// This compute shader implements a simplified Kerr black hole
+// renderer inspired by the techniques used in the movie
+// “Interstellar.”  Instead of integrating the full Kerr
+// geodesic equations in Boyer–Lindquist coordinates, we use a
+// post‑Newtonian approximation for the acceleration of photons in
+// a rotating spacetime.  The acceleration is given by the sum of
+// a Newtonian term with a relativistic correction and a
+// gravitomagnetic (frame‑dragging) term.  This approach is
+// sufficient to produce the characteristic flattened shadow and
+// swirling lensing seen around a rotating (Kerr) black hole.
+//
+// Each invocation of this shader computes the colour of one pixel
+// by launching a ray from the camera into the scene and
+// integrating its motion using a fourth‑order Runge–Kutta (RK4)
+// integrator.  If the ray crosses the event horizon it is
+// coloured black.  If it escapes to a large radius it is shaded
+// with a simple sky gradient.  A diagnostic colour is used when
+// integration terminates prematurely.
+//
+// Coordinates and units
+// ---------------------
+// We work in Cartesian coordinates (x,y,z) with units where the
+// gravitational constant G, the speed of light c and the black
+// hole mass M are all equal to one.  The spin parameter a ∈ [0,1)
+// specifies the angular momentum of the hole (a=0 is Schwarzschild,
+// a→1 is extremal Kerr).  The event horizon radius for a Kerr
+// black hole is r+ = M + sqrt(M² − a²).  In these units M=1.
+//
+// The camera is placed on the +x‑axis at a distance cameraDist
+// from the origin and looks towards the origin.  The up vector is
+// aligned with the +z‑axis and the spin axis is also along +z.
+//
+// Acceleration model
+// ------------------
+// We use the acceleration formulae from the ScienceClic/Kerr
+// simulation (see Silvera0218/BlackHole‑Simulation) which are a
+// post‑Newtonian approximation:
+//   a_grav = - (M / r^3) * pos * (1 + 3 * |L|² / r²)
+//   a_drag = - (6 * M / r^3) * (vel × J)
+// where L = pos × vel is the specific angular momentum of the
+// photon and J = (0, 0, a*M) is the angular momentum vector of the
+// hole.  The total acceleration is a_grav + a_drag.  This model
+// yields realistic lensing and frame‑dragging effects without
+// solving the full Kerr geodesics.
+
+#version 460
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (rgba8, binding = 0) uniform writeonly image2D outImage;
+
+const float PI          = 3.14159265358979323846;
+const float M           = 1.0;      // Black hole mass (units where G=c=1)
+const float a           = 0.8;      // Dimensionless spin parameter (0=Schwarzschild, 1=extremal Kerr)
+const float cameraDist  = 10.0;     // Camera distance from origin
+const float escapeRad   = 50.0;     // Escape radius beyond which rays are considered free
+const int   maxSteps    = 2000;     // Maximum RK4 integration steps
+const float stepSize    = 0.03;     // Integration time step (affine parameter)
+
+// Compute the event horizon radius r+ = M + sqrt(M^2 - a^2).
+float horizonRadius() {
+    float inside = max(M * M - a * a, 0.0);
+    return M + sqrt(inside);
+}
+
+// Compute the acceleration on a photon at position `pos` with velocity `vel`.
+// This uses a post‑Newtonian approximation for a Kerr black hole.  The
+// gravitational term includes a relativistic correction proportional to
+// the square of the specific angular momentum |L|², and the frame‑dragging
+// term is proportional to the cross product of the velocity and the
+// angular momentum vector J.
+vec3 getAcceleration(in vec3 pos, in vec3 vel) {
+    float r2 = dot(pos, pos);
+    float r  = sqrt(r2);
+    // Avoid division by zero when r→0
+    float invR3 = 1.0 / max(r2 * r, 1e-6);
+    // Specific angular momentum L = pos × vel
+    vec3 L = cross(pos, vel);
+    float L2 = dot(L, L);
+    // Newtonian + relativistic correction
+    vec3 a_grav = -M * pos * invR3 * (1.0 + 3.0 * L2 / r2);
+    // Frame‑dragging (gravitomagnetic) term
+    // Angular momentum vector of the hole J points along +z
+    vec3 J = vec3(0.0, 0.0, a * M);
+    vec3 a_drag = -(6.0 * M * invR3) * cross(vel, J);
+    return a_grav + a_drag;
+}
+
+void main() {
+    ivec2 imgSize = imageSize(outImage);
+    ivec2 gid     = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x >= imgSize.x || gid.y >= imgSize.y) return;
+
+    // Normalised device coordinates in the range [-1, 1]
+    float u = (float(gid.x) + 0.5) / float(max(imgSize.x - 1, 1));
+    float v = (float(gid.y) + 0.5) / float(max(imgSize.y - 1, 1));
+    float ndc_x = 2.0 * u - 1.0;
+    float ndc_y = 2.0 * v - 1.0;
+
+    // Aspect ratio and field of view.  A moderate FOV reveals
+    // lensing while keeping the disc in view.
+    float aspect = float(imgSize.x) / float(imgSize.y);
+    float fovY   = radians(45.0);
+    float fovX   = fovY * aspect;
+    float tanHalfFovX = tan(0.5 * fovX);
+    float tanHalfFovY = tan(0.5 * fovY);
+
+    // Camera basis: forward points from camera towards the origin along −x.
+    vec3 forward = normalize(vec3(-1.0, 0.0, 0.0));
+    vec3 up      = vec3(0.0, 0.0, 1.0);
+    vec3 right   = normalize(cross(up, forward));
+
+    // Ray direction in camera space and transform to world space.
+    vec3 dirCam   = normalize(vec3(ndc_x * tanHalfFovX, ndc_y * tanHalfFovY, -1.0));
+    vec3 dirWorld = normalize(right * dirCam.x + up * dirCam.y + forward * dirCam.z);
+
+    // Initial position and velocity
+    vec3 pos = vec3(cameraDist, 0.0, 0.0);
+    vec3 vel = dirWorld;
+
+    // Integration
+    bool captured = false;
+    bool escaped  = false;
+    bool truncated = false;
+    int iterCount = 0;
+    float rH = horizonRadius();
+    for (int i = 0; i < maxSteps; ++i) {
+        float r = length(pos);
+        if (r <= rH) {
+            captured = true;
+            break;
+        }
+        if (r >= escapeRad) {
+            escaped = true;
+            break;
+        }
+        // RK4 integration for position and velocity
+        vec3 k1_vel = stepSize * getAcceleration(pos, vel);
+        vec3 k1_pos = stepSize * vel;
+        vec3 k2_vel = stepSize * getAcceleration(pos + 0.5 * k1_pos, vel + 0.5 * k1_vel);
+        vec3 k2_pos = stepSize * (vel + 0.5 * k1_vel);
+        vec3 k3_vel = stepSize * getAcceleration(pos + 0.5 * k2_pos, vel + 0.5 * k2_vel);
+        vec3 k3_pos = stepSize * (vel + 0.5 * k2_vel);
+        vec3 k4_vel = stepSize * getAcceleration(pos + k3_pos, vel + k3_vel);
+        vec3 k4_pos = stepSize * (vel + k3_vel);
+        pos += (k1_pos + 2.0 * k2_pos + 2.0 * k3_pos + k4_pos) / 6.0;
+        vel += (k1_vel + 2.0 * k2_vel + 2.0 * k3_vel + k4_vel) / 6.0;
+        iterCount = i;
+    }
+    if (!captured && !escaped) {
+        truncated = true;
+    }
+
+    vec4 color;
+    if (captured) {
+        // Fell into the event horizon
+        color = vec4(0.0, 0.0, 0.0, 1.0);
+    } else if (escaped) {
+        // Map the outgoing direction to a sky colour.  We use the final
+        // velocity to determine φ and a simple gradient for θ.  The hue
+        // is generated via sinusoids to avoid seams.
+        float phi    = atan(vel.y, vel.z);
+        float theta  = acos(clamp(vel.x / length(vel), -1.0, 1.0));
+        float phiNorm   = (phi + PI) / (2.0 * PI);
+        float thetaNorm = clamp(theta / PI, 0.0, 1.0);
+        vec3 skyColorTop    = vec3(0.1, 0.2, 0.6);
+        vec3 skyColorBottom = vec3(0.6, 0.7, 1.0);
+        vec3 base = mix(skyColorTop, skyColorBottom, thetaNorm);
+        // Phase‑shifted sine waves for continuous hue
+        float phase0 = phi;
+        float phase1 = phi + 2.094395102393195492;  // 120° in radians
+        float phase2 = phi + 4.188790204786390984;  // 240° in radians
+        vec3 hue = vec3(
+            0.5 + 0.5 * sin(phase0),
+            0.5 + 0.5 * sin(phase1),
+            0.5 + 0.5 * sin(phase2)
+        );
+        vec3 finalColor = mix(base, hue, 0.5);
+        // Dim the colour for rays that spend longer near the hole
+        float stepFrac = float(iterCount) / float(maxSteps);
+        finalColor *= mix(1.0, 0.2, stepFrac);
+        color = vec4(finalColor, 1.0);
+    } else {
+        // Diagnostic colour for truncated rays
+        float f = float(iterCount) / float(maxSteps);
+        color = vec4(f, 0.0, 1.0 - f, 1.0);
+    }
+    imageStore(outImage, gid, color);
+}

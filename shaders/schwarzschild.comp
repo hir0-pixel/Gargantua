@@ -1,0 +1,397 @@
+// ---------------------------------------------
+// Schwarzschild geodesic ray tracer
+//
+// This compute shader implements the integration of null geodesics
+// (photon world‑lines) in the Schwarzschild metric.  Each invocation
+// corresponds to a single pixel of an offscreen image; the ray for
+// that pixel is generated from a simple pin‑hole camera located at a
+// fixed radial distance from the black hole.  The ray is then
+// propagated backwards in time using a fourth–order Runge–Kutta (RK4)
+// integrator until it either intersects the event horizon or escapes
+// to a predefined large radius.  When a ray escapes, its exit
+// direction on the celestial sphere is used to shade the pixel with
+// a simple gradient.  Rays that hit the horizon are coloured black.
+//
+// Coordinates and units
+// ---------------------
+// The Schwarzschild line element in units with c = G = M = 1 is
+//
+//     ds² = -(1 - Rs/r) dt² + (1 - Rs/r)⁻¹ dr²
+//           + r² (dθ² + sin²θ dφ²)
+//
+// with Schwarzschild radius Rs = 2.0.  In this shader we set
+// Rs = 1.0 to keep the event horizon at r = 1.0.  The camera is
+// positioned at r = cameraDistance * Rs on the equatorial plane
+// (θ = π/2) with azimuth φ = 0 and looks towards the origin.  A
+// local orthonormal tetrad is used to convert the direction in
+// camera space into the coordinate basis of the Schwarzschild metric.
+//
+// Christoffel symbols
+// -------------------
+// Only the non‑vanishing Christoffel symbols of the Schwarzschild
+// metric are needed for the geodesic equations.  Denoting f(r) =
+// 1 - Rs/r and remembering that Γ^μ_{αβ} = Γ^μ_{βα} we have
+//
+//   Γ^r_{tt}   =  (Rs / (2 r²)) (1 - Rs/r)
+//   Γ^r_{rr}   = - Rs / (2 r (r - Rs))
+//   Γ^r_{θθ}   = - (r - Rs)
+//   Γ^r_{φφ}   = - (r - Rs) sin²θ
+//   Γ^θ_{rθ}   =  Γ^θ_{θr} = 1/r
+//   Γ^θ_{φφ}   = - sinθ cosθ
+//   Γ^φ_{rφ}   =  Γ^φ_{φr} = 1/r
+//   Γ^φ_{θφ}   =  Γ^φ_{φθ} = cotθ = cosθ/sinθ
+//
+// These were derived from the general definition of the Christoffel
+// symbols and can be verified in standard general relativity
+// references【873205866879793†L150-L241】.
+//
+// Geodesic equations
+// ------------------
+// For null geodesics the proper time vanishes, so we integrate with
+// respect to an affine parameter λ.  The equations of motion for
+// positions (r, θ, φ) and their canonical momenta (pr, pθ, pφ) are
+//
+//   dr/dλ     = pr
+//   dθ/dλ     = pθ
+//   dφ/dλ     = pφ
+//   dpr/dλ    = -Γ^r_{tt}  (p_t)² - Γ^r_{rr}  pr²
+//                - Γ^r_{θθ} pθ²   - Γ^r_{φφ} pφ²
+//   dpθ/dλ    = -2 Γ^θ_{rθ} pr pθ - Γ^θ_{φφ} pφ²
+//   dpφ/dλ    = -2 Γ^φ_{rφ} pr pφ - 2 Γ^φ_{θφ} pθ pφ
+//
+// The energy of the photon is a conserved quantity given by
+// E = (1 - Rs/r) p_t.  Because p_t does not appear on the right
+// hand side of the position equations we do not integrate it.  At
+// the camera position r = r_cam we choose the local 4‑momentum such
+// that the temporal component in the orthonormal frame is 1.  This
+// fixes the energy E = sqrt(1 - Rs/r_cam).  At any radius r the
+// coordinate time component of the momentum is then
+//
+//   p_t(r) = E / (1 - Rs/r).
+//
+// Integration and termination
+// ---------------------------
+// A fixed step size RK4 integrator advances the state.  If the
+// radial coordinate falls below Rs the ray has crossed the horizon
+// and the pixel is coloured black.  If the radial coordinate
+// exceeds a user‑defined escape radius or if the maximum number of
+// integration steps is reached, the ray is considered to have
+// escaped.  The exit direction on the sky (θ, φ) is mapped to a
+// simple gradient to produce a colourful background.  The gradient
+// uses φ/(2π) for the red channel, θ/π for the green channel and
+// 1 - φ/(2π) for the blue channel.
+//
+#version 460
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (rgba8, binding = 0) uniform writeonly image2D outImage;
+
+const float PI          = 3.14159265358979323846;
+const float Rs          = 1.0;      // Schwarzschild radius; horizon at r=1
+const float cameraDist  = 10.0;     // Camera radius in units of Rs
+// Adjusted integration parameters.  A larger step size combined with a
+// higher maximum iteration count ensures that rays either reach the
+// escape radius or fall into the horizon before the integrator
+// truncates.  The escape radius need not be huge; values around
+// 30–50 are sufficient to approximate infinity for the visual effect.
+const float escapeRad   = 50.0;     // Escape radius; rays beyond this are considered free
+const int   maxSteps    = 2000;     // Maximum RK4 integration steps per ray
+const float stepSize    = 0.1;      // Affine parameter step size per integration
+
+// Evaluate derivatives of the geodesic state.  The state consists of
+// the positions (r, θ, φ) and their momenta (pr, pθ, pφ).  The
+// coordinate time momentum p_t is reconstructed from the conserved
+// energy E and the current radius.
+void geodesicDerivatives(
+    float r, float theta,
+    float pr, float ptheta, float pphi,
+    float E,
+    out float drdtau, out float dthetadtau, out float dphidtau,
+    out float dprdtau, out float dpthetadtau, out float dpphidtau)
+{
+    // Velocities of the positions
+    drdtau      = pr;
+    // In the equatorial approximation we hold θ constant at π/2.  This avoids
+    // the coordinate singularity at the poles and produces a symmetric
+    // photon ring without vertical seams.  Therefore dθ/dλ = 0 and
+    // dpθ/dλ = 0 for all rays.
+    dthetadtau  = 0.0;
+    dphidtau    = pphi;
+
+    // Compute commonly used quantities
+    float inv = 1.0 / r;
+    float f   = 1.0 - Rs * inv;               // f(r) = 1 - Rs/r
+    float sinT = sin(theta);
+    float cosT = cos(theta);
+    float sin2 = sinT * sinT;
+    // Safeguard against division by zero at the poles
+    float cotT;
+    if (abs(sinT) < 1e-6) {
+        cotT = 0.0;
+    } else {
+        cotT = cosT / sinT;
+    }
+
+    // Conserved energy gives the time component of momentum: p_t = E / (1 - Rs/r)
+    float pt = E / f;
+
+    // Christoffel symbols (only the non‑zero ones)
+    float gamma_r_tt   = (Rs * 0.5 * inv * inv) * f;                  // Γ^r_tt
+    float gamma_r_rr   = -0.5 * Rs * inv / (r - Rs);                  // Γ^r_rr
+    float gamma_r_thth = -(r - Rs);                                   // Γ^r_θθ
+    float gamma_r_phph = gamma_r_thth * sin2;                         // Γ^r_φφ
+    float gamma_th_rth = inv;                                         // Γ^θ_rθ = Γ^θ_θr
+    float gamma_th_phph = -sinT * cosT;                               // Γ^θ_φφ
+    float gamma_ph_rph = inv;                                         // Γ^φ_rφ = Γ^φ_φr
+    float gamma_ph_thph = cotT;                                       // Γ^φ_θφ = Γ^φ_φθ
+
+    // Accelerations (second derivatives of positions)
+    // Note: the geodesic equation is x¨^μ + Γ^μ_{αβ} x˙^α x˙^β = 0.
+    // Here we compute -Γ^μ_{αβ} x˙^α x˙^β.
+    // Radial momentum derivative
+    dprdtau = -(
+        gamma_r_tt   * (pt * pt) +
+        gamma_r_rr   * (pr * pr) +
+        gamma_r_thth * (ptheta * ptheta) +
+        gamma_r_phph * (pphi * pphi)
+    );
+    // Polar momentum derivative
+    // θ-momentum is constant in the equatorial plane.
+    dpthetadtau = 0.0;
+    // Azimuthal momentum derivative
+    dpphidtau = -(
+        2.0 * gamma_ph_rph   * pr * pphi +
+        2.0 * gamma_ph_thph  * ptheta * pphi
+    );
+}
+
+void main() {
+    ivec2 imgSize = imageSize(outImage);
+    ivec2 gid     = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x >= imgSize.x || gid.y >= imgSize.y) return;
+
+    // Normalised device coordinates in the range [-1, 1]
+    float u = (float(gid.x) + 0.5) / float(max(imgSize.x - 1, 1));
+    float v = (float(gid.y) + 0.5) / float(max(imgSize.y - 1, 1));
+    float ndc_x = 2.0 * u - 1.0;
+    float ndc_y = 2.0 * v - 1.0;
+
+    // Aspect ratio and field of view (vertical).  A moderate FOV helps
+    // reveal the gravitational lensing.  You can adjust fovY as
+    // desired; fovX is derived from the aspect ratio.
+    float aspect = float(imgSize.x) / float(imgSize.y);
+    float fovY   = radians(45.0);
+    float fovX   = fovY * aspect;
+    float tanHalfFovX = tan(0.5 * fovX);
+    float tanHalfFovY = tan(0.5 * fovY);
+
+    // Camera orthonormal basis.  The camera sits at (x = r_cam, y = 0,
+    // z = 0) looking towards the origin.  We choose the up vector to
+    // point along the positive z‑axis.  From this we derive a right
+    // vector via a cross product.  The basis vectors satisfy: forward =
+    // −r̂, up = ẑ, right = up × forward.  All three are unit length.
+    float r_cam = cameraDist * Rs;
+    vec3 forward = normalize(vec3(-1.0, 0.0, 0.0)); // from camera towards origin
+    vec3 up      = vec3(0.0, 0.0, 1.0);
+    vec3 right   = normalize(cross(up, forward));
+
+    // Ray direction in camera space (before mapping to world).  We
+    // construct a vector pointing through the image plane at z = -1.
+    vec3 dirCam = normalize(vec3(ndc_x * tanHalfFovX, ndc_y * tanHalfFovY, -1.0));
+    // Transform to world space
+    // Convert camera direction to world space.  Because our forward vector
+    // points towards the origin (negative X), we need to flip the sign of
+    // the z‑component when combining with the camera space direction.  Without
+    // this negation, rays would be launched away from the black hole and
+    // never reach the horizon or escape radius, leading to a red debug
+    // screen.  See comment above for derivation.
+    vec3 dirWorld = normalize(right * dirCam.x + up * dirCam.y + forward * (-dirCam.z));
+
+    // Spherical basis vectors at the camera position (θ = π/2, φ = 0)
+    // derived from the standard relations: r̂ = (1,0,0), θ̂ = (0,0,-1), φ̂ = (0,1,0).
+    vec3 rHat  = vec3(1.0, 0.0, 0.0);
+    vec3 thHat = vec3(0.0, 0.0, -1.0);
+    vec3 phHat = vec3(0.0, 1.0, 0.0);
+
+    // Decompose the world‑space direction into the orthonormal tetrad
+    // components.  The spatial components of the local 4‑momentum are
+    // simply the projections onto (r̂, θ̂, φ̂).  The temporal component
+    // in the orthonormal frame is set to 1.  The resulting 4‑momentum
+    // in the coordinate frame is then given by
+    //   p_t     = 1/√f
+    //   p_r     = √f * d_r
+    //   p_θ     = (1/r) d_θ
+    //   p_φ     = (1/(r sinθ)) d_φ
+    // where f = 1 - Rs/r is the redshift factor.  At the camera we
+    // have r = r_cam and θ = π/2 (so sinθ = 1).
+    float d_r    = dot(dirWorld, rHat);
+    float d_theta= dot(dirWorld, thHat);
+    float d_phi  = dot(dirWorld, phHat);
+
+    // Metric factor at the camera
+    float f0 = 1.0 - Rs / r_cam;
+    // Conserved energy E = sqrt(f0) as explained above
+    float E = sqrt(max(f0, 0.0));
+
+    // Initial momenta in coordinate basis
+    // p_t is not stored explicitly; p_r, p_θ and p_φ are
+    // initialised according to the tetrad transformation.
+    float pr    = sqrt(max(f0, 0.0)) * d_r;
+    float ptheta= 0.0; // equatorial plane: zero polar momentum
+    float pphi  = (1.0 / r_cam) * d_phi;
+
+    // Initial positions in spherical coordinates
+    float r     = r_cam;
+    float theta = PI * 0.5;  // equatorial plane
+    float phi   = 0.0;       // azimuth origin
+
+    // Colour accumulator
+    vec4 color = vec4(0.0);
+    bool escaped = false;
+    bool captured= false;
+    // Flag used when the integrator reaches the maximum number of steps
+    // without the ray either crossing the horizon or escaping beyond
+    // escapeRad.  In this case we output a diagnostic colour to
+    // visualise regions of the image where integration was truncated.
+    bool truncated = false;
+
+    // Integration loop
+    int iterCount = 0;
+    for (int i = 0; i < maxSteps; ++i) {
+        // Horizon check
+        if (r <= Rs) {
+            captured = true;
+            break;
+        }
+        // Escape check
+        if (r >= escapeRad) {
+            escaped = true;
+            break;
+        }
+
+        // Perform one RK4 step.  Each stage stores derivatives for
+        // (r, θ, φ, pr, pθ, pφ).
+        float k1_dr, k1_dtheta, k1_dphi;
+        float k1_dpr, k1_dptheta, k1_dpphi;
+        geodesicDerivatives(r, theta, pr, ptheta, pphi, E,
+                            k1_dr, k1_dtheta, k1_dphi,
+                            k1_dpr, k1_dptheta, k1_dpphi);
+
+        float r2     = r     + 0.5 * stepSize * k1_dr;
+        float theta2 = theta + 0.5 * stepSize * k1_dtheta;
+        float pr2    = pr    + 0.5 * stepSize * k1_dpr;
+        float ptheta2= ptheta+ 0.5 * stepSize * k1_dptheta;
+        float pphi2  = pphi  + 0.5 * stepSize * k1_dpphi;
+        float k2_dr, k2_dtheta, k2_dphi;
+        float k2_dpr, k2_dptheta, k2_dpphi;
+        geodesicDerivatives(r2, theta2, pr2, ptheta2, pphi2, E,
+                            k2_dr, k2_dtheta, k2_dphi,
+                            k2_dpr, k2_dptheta, k2_dpphi);
+
+        float r3     = r     + 0.5 * stepSize * k2_dr;
+        float theta3 = theta + 0.5 * stepSize * k2_dtheta;
+        float pr3    = pr    + 0.5 * stepSize * k2_dpr;
+        float ptheta3= ptheta+ 0.5 * stepSize * k2_dptheta;
+        float pphi3  = pphi  + 0.5 * stepSize * k2_dpphi;
+        float k3_dr, k3_dtheta, k3_dphi;
+        float k3_dpr, k3_dptheta, k3_dpphi;
+        geodesicDerivatives(r3, theta3, pr3, ptheta3, pphi3, E,
+                            k3_dr, k3_dtheta, k3_dphi,
+                            k3_dpr, k3_dptheta, k3_dpphi);
+
+        float r4     = r     + stepSize * k3_dr;
+        float theta4 = theta + stepSize * k3_dtheta;
+        float pr4    = pr    + stepSize * k3_dpr;
+        float ptheta4= ptheta+ stepSize * k3_dptheta;
+        float pphi4  = pphi  + stepSize * k3_dpphi;
+        float k4_dr, k4_dtheta, k4_dphi;
+        float k4_dpr, k4_dptheta, k4_dpphi;
+        geodesicDerivatives(r4, theta4, pr4, ptheta4, pphi4, E,
+                            k4_dr, k4_dtheta, k4_dphi,
+                            k4_dpr, k4_dptheta, k4_dpphi);
+
+        float inv6 = 1.0 / 6.0;
+        r      += stepSize * (k1_dr     + 2.0 * k2_dr     + 2.0 * k3_dr     + k4_dr)     * inv6;
+        theta  += stepSize * (k1_dtheta + 2.0 * k2_dtheta + 2.0 * k3_dtheta + k4_dtheta) * inv6;
+        phi    += stepSize * (k1_dphi   + 2.0 * k2_dphi   + 2.0 * k3_dphi   + k4_dphi)   * inv6;
+        pr     += stepSize * (k1_dpr    + 2.0 * k2_dpr    + 2.0 * k3_dpr    + k4_dpr)    * inv6;
+        ptheta += stepSize * (k1_dptheta+ 2.0 * k2_dptheta+ 2.0 * k3_dptheta+ k4_dptheta) * inv6;
+        pphi   += stepSize * (k1_dpphi  + 2.0 * k2_dpphi  + 2.0 * k3_dpphi  + k4_dpphi)  * inv6;
+
+        // Keep θ within [0, π] to avoid numerical drift beyond the poles
+        if (theta < 0.0)        theta = -theta;
+        if (theta > PI)         theta = PI - (theta - PI);
+
+        // Wrap φ to [0, 2π) for stability.  Use fract instead of mod
+        // because GLSL's mod() returns a negative remainder when the input
+        // is negative.  The fract(x) function returns the fractional part
+        // of x for any real number, ensuring we always get a value in [0,1).
+        phi = fract(phi / (2.0 * PI)) * (2.0 * PI);
+
+        // Track the number of successful integration steps.  This
+        // counter is later used to colour debug pixels when the
+        // integration terminates due to the step limit rather than a
+        // physical capture or escape.
+        iterCount = i;
+    }
+
+    // If we exit the loop without setting either captured or escaped
+    // then the integration hit the maximum step count.  Flag this
+    // situation so that we can output a diagnostic colour below.
+    if (!captured && !escaped) {
+        truncated = true;
+    }
+
+    if (captured) {
+        // Event horizon – output black.  These rays fall into the
+        // black hole and contribute no light to the image.
+        color = vec4(0.0, 0.0, 0.0, 1.0);
+    } else if (escaped) {
+        // Escape – map exit direction to a background gradient.  We
+        // interpret the exit (θ, φ) as a direction on the celestial
+        // sphere.  The azimuth φ modulates the hue while the polar
+        // angle θ controls a simple sky gradient.  We also modulate
+        // the brightness by the fraction of integration steps taken
+        // (higher iterCount means stronger lensing and dimmer sky).
+        // Use atan2 to wrap phi smoothly.  The direct fract(phi/(2π)) mapping
+        // produces a discontinuity along the branch cut (phi = 0/2π) which
+        // appears as a vertical seam in the rendered image.  By computing
+        // the angle with atan2(sinφ, cosφ) and normalising it to [0,1],
+        // we ensure a continuous mapping across the full circle.
+        float phiWrapped = atan(sin(phi), cos(phi));
+        float phiNorm    = (phiWrapped + PI) / (2.0 * PI);
+        float thetaNorm = clamp(theta / PI, 0.0, 1.0);
+        // Base sky colours (bottom and top of the gradient)
+        vec3 skyColorTop    = vec3(0.1, 0.2, 0.6);
+        vec3 skyColorBottom = vec3(0.6, 0.7, 1.0);
+        vec3 base = mix(skyColorTop, skyColorBottom, thetaNorm);
+        // Hue based on φ
+        // Generate a continuous hue from φ using phase-shifted sine waves.  This
+        // avoids discontinuities at φ = 0/2π that would otherwise appear
+        // as vertical seams in the image.  We combine sinusoids with 120°
+        // phase offsets to produce RGB components that smoothly cycle over φ.
+        float phase0 = phi;
+        float phase1 = phi + 2.094395102393195492;  // 120° in radians
+        float phase2 = phi + 4.188790204786390984;  // 240° in radians
+        vec3 hue = vec3(
+            0.5 + 0.5 * sin(phase0),
+            0.5 + 0.5 * sin(phase1),
+            0.5 + 0.5 * sin(phase2)
+        );
+        vec3 finalColor = mix(base, hue, 0.5);
+        // Dim the colour for rays that spend longer near the black
+        // hole.  Normalise the iteration count by the maximum and
+        // reduce brightness accordingly.
+        float stepFrac = float(iterCount) / float(maxSteps);
+        finalColor *= mix(1.0, 0.2, stepFrac);
+        color = vec4(finalColor, 1.0);
+    } else if (truncated) {
+        // Diagnostic colour for rays whose integration ran out of
+        // steps.  We encode the iteration fraction as a red/blue
+        // gradient: early termination is blue, near‑maximum is red.
+        float f = float(iterCount) / float(maxSteps);
+        color = vec4(f, 0.0, 1.0 - f, 1.0);
+    }
+
+    imageStore(outImage, gid, color);
+}

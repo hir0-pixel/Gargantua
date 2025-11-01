@@ -20,19 +20,31 @@ if(NOT EXISTS "${GLSLC_EXE}")
     message(FATAL_ERROR "glslc not found at ${GLSLC_EXE}")
 endif()
 
-set(SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/shaders/test.comp")
+# Find all .comp shader files
+file(GLOB SHADER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.comp")
+
+# Output directory for compiled shaders
 set(SHADER_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders/bin")
 file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
-set(SHADER_SPV "${SHADER_OUT_DIR}/test.comp.spv")
 
-add_custom_command(
-        OUTPUT "${SHADER_SPV}"
-        COMMAND "${GLSLC_EXE}" "${SHADER_SRC}" -o "${SHADER_SPV}"
-        DEPENDS "${SHADER_SRC}"
-        COMMENT "Compiling compute shader: test.comp -> test.comp.spv"
-)
+# Compile each shader to .spv
+set(SHADER_SPV_FILES "")
+foreach(SHADER_SRC ${SHADER_SOURCES})
+    get_filename_component(SHADER_NAME ${SHADER_SRC} NAME)
+    set(SHADER_SPV "${SHADER_OUT_DIR}/${SHADER_NAME}.spv")
 
-add_custom_target(compile_shaders ALL DEPENDS "${SHADER_SPV}")
+    add_custom_command(
+            OUTPUT "${SHADER_SPV}"
+            COMMAND "${GLSLC_EXE}" "${SHADER_SRC}" -o "${SHADER_SPV}"
+            DEPENDS "${SHADER_SRC}"
+            COMMENT "Compiling shader: ${SHADER_NAME} -> ${SHADER_NAME}.spv"
+    )
+
+    list(APPEND SHADER_SPV_FILES "${SHADER_SPV}")
+endforeach()
+
+# Create target that depends on all compiled shaders
+add_custom_target(compile_shaders ALL DEPENDS ${SHADER_SPV_FILES})
 
 # Pass absolute shader directory to the app
 add_compile_definitions(GARGANTUA_SHADER_DIR="${SHADER_OUT_DIR}")
@@ -65,4 +77,5 @@ endif()
 
 message(STATUS "Vulkan Include: ${Vulkan_INCLUDE_DIR}")
 message(STATUS "Vulkan Library: ${Vulkan_LIBRARY}")
-message(STATUS "Shaders out: ${SHADER_OUT_DIR}")
+message(STATUS "Shaders output: ${SHADER_OUT_DIR}")
+message(STATUS "Found ${CMAKE_MATCH_COUNT} shader files to compile")

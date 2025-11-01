@@ -2,7 +2,9 @@
 #include <vulkan/vulkan.h>
 #include <vector>
 #include <string>
-
+struct CameraData {
+    float x, y, zoom, time;  // Changed padding to time
+};
 class VulkanContext;
 class Swapchain;
 
@@ -22,7 +24,7 @@ public:
     //   1) compute dispatch (compute queue)
     //   2) storage->swapchain blit (graphics queue)
     // Uses waitSemaphore (from acquire) and signalSemaphore (for present).
-    void dispatch(uint32_t imageIndex, VkSemaphore waitSemaphore, VkSemaphore signalSemaphore);
+    void dispatch(uint32_t imageIndex, VkSemaphore waitSemaphore, VkSemaphore signalSemaphore, const CameraData& camera);
 
 private:
     // Creation
