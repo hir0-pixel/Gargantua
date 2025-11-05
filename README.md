@@ -111,7 +111,3 @@ Requirements:
 ---
 
 *(Developed as a personal project to study black hole rendering and practice GPU shader optimization on a computationally demanding simulation.)*
-
----
-
-Would you like me to also write a short **“About this project” paragraph** (2–3 lines) you can put at the top of your GitHub repo description?
