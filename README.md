@@ -26,7 +26,7 @@ So far, the project has:
 
 * A fully working **Vulkan compute pipeline**
 * **Offscreen storage image** rendered through a swapchain
-* A **stable 60 FPS** render loop
+* A **stable ~24 FPS** render loop
 * Working **Schwarzschild ray tracing** with RK4 integration
 * Basic **accretion disk and background rendering**
 
