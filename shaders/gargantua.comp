@@ -9,7 +9,7 @@ layout(push_constant) uniform CameraUniforms {
     float time;
 } camera;
 
-const int AA = 1;
+const int AA = 2;
 const float Speed = 3.0;
 const float Steps = 12.0;
 const float Rs = 1.0;  // Schwarzschild radius in geometric units
@@ -203,7 +203,6 @@ vec3 geodesicAcceleration(vec3 pos, vec3 vel) {
     float f_prime = Rs / r2;  // df/dr
 
     // Geodesic equation in Schwarzschild (Cartesian form)
-    // d²x/dλ² = Γ terms
 
     // Radial component
     vec3 acc_radial = -(f_prime / (2.0 * f)) * (f * (1.0 + dot(vel, vel)) - vr * vr / f) * rhat;
@@ -246,6 +245,15 @@ void rk4Step(inout Photon p, float h) {
     p.vel += (h / 6.0) * (k1v + 2.0 * k2v + 2.0 * k3v + k4v);
 }
 
+// Simple saturation and contrast adjustment
+vec3 adjustSaturationContrast(vec3 color, float saturation, float contrast) {
+    float lum = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    vec3 gray = vec3(lum);
+    vec3 satColor = mix(gray, color, saturation);
+    vec3 contrasted = (satColor - 0.5) * contrast + 0.5;
+    return clamp(contrasted, 0.0, 1.0);
+}
+
 vec4 traceGeodesic(vec3 startPos, vec3 startDir, float iTime) {
     Photon photon;
     photon.pos = startPos;
@@ -270,11 +278,10 @@ vec4 traceGeodesic(vec3 startPos, vec3 startDir, float iTime) {
         // Event horizon check
         if (r < Rs * 1.05) {
             float fade = smoothstep(Rs * 0.9, Rs * 1.2, r);
-            float darkness = mix(0.08, 1.0, fade);     // 0.08 = deep near center, 1.0 = normal far away
+            float darkness = mix(0.08, 1.0, fade);
 
             vec3 shadowMix = (diskColor.rgb * diskColor.a + glow.rgb * (1.0 - diskColor.a)) * darkness;
 
-            // Optional slight warm bias (mimics photon redshift absorption)
             shadowMix *= vec3(0.9, 0.85, 0.8);
 
             return vec4(shadowMix, 1.0);
@@ -306,20 +313,23 @@ vec4 traceGeodesic(vec3 startPos, vec3 startDir, float iTime) {
             }
         }
 
-        // Gravitational glow
+        // Gravitational glow, made tighter and less spread
         float r2 = r * r;
-        float glowIntensity = 0.002 / (r2 * r2);
-        glow += vec4(1.2, 1.1, 1.0, 1.0) * glowIntensity * clamp(r * 1.5 - 1.2, 0.0, 1.0);
+        float rNorm = r / Rs;
+        if (rNorm > 1.05 && rNorm < 6.0) {
+            float glowIntensity = 0.0015 / (r2 * r); // ~1/r^3 falloff
+            float focus = smoothstep(1.1, 2.5, rNorm) * (1.0 - smoothstep(3.5, 6.0, rNorm));
+            glow += vec4(1.25, 1.15, 1.05, 1.0) * glowIntensity * focus;
+        }
 
-        // Photon sphere highlight
+        // Photon sphere highlight, slightly reduced
         if (r > Rs * 1.48 && r < Rs * 1.52) {
-            glow += vec4(0.5, 0.4, 0.3, 0.0) * 0.01;
+            glow += vec4(0.5, 0.4, 0.3, 0.0) * 0.005;
         }
     }
 
     vec4 bg = background(normalize(photon.vel));
     return vec4(diskColor.rgb * diskColor.a + (1.0 - diskColor.a) * bg.rgb + glow.rgb, 1.0);
-
 }
 
 void main() {
@@ -334,22 +344,31 @@ void main() {
 
     for (int j = 0; j < AA; j++)
     for (int i = 0; i < AA; i++) {
-        vec2 uv = (fragCoord + vec2(float(i), float(j)) / float(AA) - iResolution.xy * 0.5) / iResolution.y;
+        // Jittered AA within pixel
+        float seed = hash2(fragCoord + vec2(i, j) + vec2(iTime));
+        vec2 jitter = vec2(seed, hash(seed + 13.37)) / float(AA);
+
+        vec2 uv = (fragCoord + (vec2(float(i), float(j)) + jitter) / float(AA) - iResolution * 0.5) / iResolution.y;
         vec3 ray = normalize(vec3(uv, 1.2));
 
         float camDist = 8.0 * camera.cam_zoom;
         vec3 pos = vec3(0.0, 0.0, -camDist);
 
-        // And fix the viewing angle:
-        vec2 angle = vec2(iTime * 0.05, 1.2);  // Was 1.57, now 1.2 for better side view
-        angle.x += camera.cam_x * 0.001;  // Increased sensitivity
+        // Viewing angle
+        vec2 angle = vec2(iTime * 0.05, 1.2);
+        angle.x += camera.cam_x * 0.001;
         angle.y += camera.cam_y * 0.001;
 
         Rotate(pos, angle);
         Rotate(ray, angle);
 
         vec4 col = traceGeodesic(pos, ray, iTime);
-        col.rgb = pow(col.rgb, vec3(0.6));
+
+        // Tone mapping with extra saturation and contrast
+        col.rgb = pow(col.rgb, vec3(0.7));
+        col.rgb = adjustSaturationContrast(col.rgb, 1.25, 1.15);
+        col.rgb *= 1.05; // slight exposure bump
+        col.rgb = clamp(col.rgb, 0.0, 1.0);
 
         colOut += col / float(AA * AA);
     }
